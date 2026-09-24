@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Spořič pro kocici-hlidac: kočka spí na klávesnici.
+
+Kočka je klasické ASCII od Felixe Lee. Okno zavírá hlídač po odemčení;
+když sem přesto dorazí klávesa (hlídač neběží), spořič se sám ukončí.
+"""
+import os
+import random
+import select
+import signal
+import sys
+import termios
+import time
+import tty
+
+PROGRESS_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "kocici-hlidac.progress")
+
+CAT_EXHALE = [
+    r"      |\      _,,,---,,_",
+    r"      /,`.-'`'    -.  ;-;;,_",
+    r"     |,4-  ) )-,_. ,\ (  `'-'",
+    r"    '---''(_/--'  `-'\_)",
+]
+CAT_INHALE = [
+    r"      |\     _,,,----,,_",
+    r"      /,`.-'`'     -.  ;-;;,_",
+    r"     |,4-  ) )-,_. ,\ (  `'-'",
+    r"    '---''(_/--'  `-'\_)",
+]
+LANG = os.environ.get("KOCICI_LANG") or ("cs" if os.environ.get("LANG", "").startswith("cs") else "en")
+GREETING = os.environ.get("KOCICI_POZDRAV", "")
+TEXTS = {
+    "cs": ("Kočka spí. Klávesnice je zamčená.", "Odemkneš napsáním:  ", "mnau"),
+    "en": ("The cat is asleep. Keyboard is locked.", "Type to unlock:  ", "meow"),
+}
+LOCKED_TXT, UNLOCK_TXT, DEFAULT_WORD = TEXTS.get(LANG, TEXTS["en"])
+
+KEYBOARD_CS = [
+    "╭──────────────────────────────────────╮",
+    "│ ; ě š č ř ž ý á í é = ´  ⌫           │",
+    "│ ⇥  q w e r t z u i o p ú )           │",
+    "│ ⇪   a s d f g h j k l ů § ¨   ⏎      │",
+    "│ ⇧  \\ y x c v b n m , . -  ⇧          │",
+    "│ ctrl  ⌘  alt  ▁▁▁▁▁▁▁▁▁▁  alt  ctrl  │",
+    "╰──────────────────────────────────────╯",
+]
+KEYBOARD_EN = [
+    "╭──────────────────────────────────────╮",
+    "│ ` 1 2 3 4 5 6 7 8 9 0 - =  ⌫         │",
+    "│ ⇥  q w e r t y u i o p [ ]           │",
+    "│ ⇪   a s d f g h j k l ; ' \\   ⏎      │",
+    "│ ⇧    z x c v b n m , . /   ⇧         │",
+    "│ ctrl  ⌘  alt  ▁▁▁▁▁▁▁▁▁▁  alt  ctrl  │",
+    "╰──────────────────────────────────────╯",
+]
+KEYBOARD = KEYBOARD_CS if LANG == "cs" else KEYBOARD_EN
+
+RESET, DIM, BOLD = "\x1b[0m", "\x1b[2m", "\x1b[1m"
+CAT_C, ZZ_C, KB_C, TXT_C, OK_C, STAR_C = (
+    "\x1b[38;5;215m", "\x1b[38;5;117m", "\x1b[38;5;244m",
+    "\x1b[38;5;252m", "\x1b[38;5;150m", "\x1b[38;5;238m",
+)
+
+
+def read_progress():
+    try:
+        with open(PROGRESS_FILE) as f:
+            n, word = f.read().split()
+        return int(n), word
+    except (OSError, ValueError):
+        return 0, DEFAULT_WORD
+
+
+def frame(t, cols, rows, zs, stars):
+    grid = [[" "] * cols for _ in range(rows)]
+    color = [[""] * cols for _ in range(rows)]
+
+    def put(y, x, s, c):
+        if not 0 <= y < rows:
+            return
+        for i, ch in enumerate(s):
+            if 0 <= x + i < cols and ch != " ":
+                grid[y][x + i] = ch
+                color[y][x + i] = c
+
+    cat = CAT_INHALE if (t % 4.0) < 2.0 else CAT_EXHALE
+    block_h = len(cat) + len(KEYBOARD) - 1 + 6
+    top = max(4, (rows - block_h) // 2)
+    kb_w = len(KEYBOARD[0])
+    kb_x = (cols - kb_w) // 2
+    cat_x = kb_x + 4
+    cat_y = top
+
+    # Hvězdy jen mimo kočku, Zzz, klávesnici a text.
+    y0, y1 = cat_y - 7, cat_y + block_h + 2
+    x0, x1 = min(kb_x, (cols - 38) // 2) - 3, max(kb_x + kb_w, (cols + 38) // 2) + 3
+    for sx, sy, phase in stars:
+        if sy < rows and sx < cols and not (y0 <= sy <= y1 and x0 <= sx <= x1):
+            tw = (t * 0.7 + phase) % 6
+            put(sy, sx, "·" if tw < 5 else "✦", STAR_C)
+
+    for i, line in enumerate(cat):
+        put(cat_y + i, cat_x, line, CAT_C)
+    # Kočka leží na klávesnici: poslední řádek kočky překrývá horní hranu.
+    kb_y = cat_y + len(cat) - 1
+    for i, line in enumerate(KEYBOARD):
+        y = kb_y + i
+        for j, ch in enumerate(line):
+            x = kb_x + j
+            if 0 <= y < rows and 0 <= x < cols and grid[y][x] == " " and ch != " ":
+                grid[y][x] = ch
+                color[y][x] = KB_C
+
+    # Zzz stoupají od hlavy (vlevo nahoře).
+    head_x, head_y = cat_x + 6, cat_y
+    for born, drift in zs:
+        age = t - born
+        if 0 <= age < 6:
+            ch = "z" if age < 2 else "Z"
+            y = head_y - 1 - int(age * 0.9)
+            x = head_x - 2 - int(age * 1.6) + int(drift * age)
+            put(y, x, ch, ZZ_C + (BOLD if age > 4 else ""))
+
+    n, word = read_progress()
+    msg_y = kb_y + len(KEYBOARD) + 2
+    if GREETING:
+        put(msg_y, (cols - len(GREETING)) // 2, GREETING, BOLD + CAT_C)
+        msg_y += 2
+    line1 = LOCKED_TXT
+    put(msg_y, (cols - len(line1)) // 2, line1, TXT_C)
+    typed = " ".join(word)
+    label = UNLOCK_TXT
+    x0 = (cols - len(label) - len(typed)) // 2
+    put(msg_y + 2, x0, label, DIM + TXT_C)
+    for i, ch in enumerate(word):
+        put(msg_y + 2, x0 + len(label) + 2 * i, ch, (BOLD + OK_C) if i < n else (DIM + TXT_C))
+
+    out = ["\x1b[H"]
+    for y in range(rows):
+        cur = None
+        parts = []
+        for x in range(cols):
+            c = color[y][x]
+            if c != cur:
+                parts.append(RESET + c)
+                cur = c
+            parts.append(grid[y][x])
+        out.append("".join(parts) + RESET + ("\r\n" if y < rows - 1 else ""))
+    return "".join(out)
+
+
+def main():
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd) if os.isatty(fd) else None
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+    try:
+        if old:
+            tty.setraw(fd)
+        start = time.monotonic()
+        zs, stars, size = [], [], None
+        next_z = 0.0
+        while True:
+            t = time.monotonic() - start
+            cols, rows = os.get_terminal_size()
+            if (cols, rows) != size:
+                size = (cols, rows)
+                stars = [(random.randrange(cols), random.randrange(rows), random.random() * 6)
+                         for _ in range(cols * rows // 90)]
+                sys.stdout.write("\x1b[2J")
+            if t >= next_z:
+                zs = [z for z in zs if t - z[0] < 6] + [(t, random.uniform(-0.3, 0.3))]
+                next_z = t + 1.6
+            sys.stdout.write(frame(t, cols, rows, zs, stars))
+            sys.stdout.flush()
+            r, _, _ = select.select([fd], [], [], 0.15)
+            if r:
+                break  # klávesa prošla = hlídač neběží, nenechávej okno viset
+    finally:
+        if old:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+[Unit]
+Description=Kočičí hlídač – zamkne klávesnici, když na ní leží kočka
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kocici-hlidac
+Restart=on-failure
+RestartSec=5
+Environment=XDG_RUNTIME_DIR=%t
+
+[Install]
+WantedBy=graphical-session.target

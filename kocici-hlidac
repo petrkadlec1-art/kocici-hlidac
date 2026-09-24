@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Kočičí hlídač: pozná kočku na klávesnici, zamkne ji a pustí spící kočku.
+
+Čte klávesnice přímo z /dev/input (skupina `input`), žádné závislosti.
+
+Detekce (jen ne-modifikátory):
+  - naráz drženo >= MANY_KEYS kláves,
+  - >= 2 klávesy držené současně déle než HOLD_SECONDS (kočka si lehla),
+  - >= MASH_COUNT stisků během MASH_WINDOW s, kdy byly dole >= 3 klávesy (dupání).
+
+Zámek: klávesnice se grabne (EVIOCGRAB), takže do systému nejde nic.
+Odemčení: napsat UNLOCK (výchozí "mnau", v angličtině "meow").
+
+Proměnné prostředí:
+  KOCICI_LANG     cs | en (výchozí podle LANG)
+  KOCICI_UNLOCK   odemykací slovo, jen písmena a–z (fyzická pozice kláves US)
+  KOCICI_POZDRAV  volitelný pozdrav nahoře na spořiči
+
+Použití:
+  kocici-hlidac            démon
+  kocici-hlidac --debug    jen loguje, co by detekoval, nezamyká
+  kocici-hlidac --test     za 3 s zamkne (vyzkoušení)
+"""
+import fcntl
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+MANY_KEYS = 4
+HOLD_SECONDS = 1.5
+MASH_COUNT = 4
+MASH_WINDOW = 2.0
+COOLDOWN = 5.0
+LANG = os.environ.get("KOCICI_LANG") or ("cs" if os.environ.get("LANG", "").startswith("cs") else "en")
+UNLOCK = os.environ.get("KOCICI_UNLOCK", "mnau" if LANG == "cs" else "meow").lower()
+
+EV_SYN, EV_KEY = 0, 1
+EVENT = struct.Struct("llHHi")
+KEY_MAX = 0x2FF
+EVIOCGRAB = 0x40044590
+EVIOCGKEY = (2 << 30) | (((KEY_MAX + 7) // 8) << 16) | (0x45 << 8) | 0x18
+
+MODIFIERS = {29, 97, 42, 54, 56, 100, 125, 126, 58}  # ctrl, shift, alt, super, capslock
+LETTERS = {c: k for c, k in zip("qwertyuiop", range(16, 26))}
+LETTERS.update({c: k for c, k in zip("asdfghjkl", range(30, 39))})
+LETTERS.update({c: k for c, k in zip("zxcvbnm", range(44, 51))})
+if not UNLOCK or any(c not in LETTERS for c in UNLOCK):
+    sys.exit(f"KOCICI_UNLOCK smí obsahovat jen písmena a–z: {UNLOCK!r}")
+UNLOCK_CODES = [LETTERS[c] for c in UNLOCK]
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+PROGRESS_FILE = os.path.join(RUNTIME, "kocici-hlidac.progress")
+SCREENSAVER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "kocici-spanek")
+OMARCHY = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")
+
+DEBUG = "--debug" in sys.argv
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def find_keyboards():
+    """Zařízení s handlerem kbd, která mají písmena A–Z."""
+    found, block = [], {}
+    with open("/proc/bus/input/devices") as f:
+        text = f.read()
+    for chunk in text.strip().split("\n\n"):
+        block = {}
+        for line in chunk.splitlines():
+            if line.startswith("N: Name="):
+                block["name"] = line[8:].strip('"')
+            elif line.startswith("H: Handlers="):
+                block["handlers"] = line[12:].split()
+            elif line.startswith("B: KEY="):
+                words = line[7:].split()[::-1]
+                block["keys"] = sum(int(w, 16) << (64 * i) for i, w in enumerate(words))
+        keys = block.get("keys", 0)
+        if "kbd" not in block.get("handlers", []):
+            continue
+        if not all(keys >> k & 1 for k in (30, 44, 16, 50)):  # a z q m
+            continue
+        ev = next((h for h in block["handlers"] if h.startswith("event")), None)
+        if ev:
+            found.append(("/dev/input/" + ev, block.get("name", ev)))
+    return found
+
+
+class Hlidac:
+    def __init__(self):
+        self.devs = {}  # fd -> (path, name)
+        self.down = {}  # keycode -> čas stisku
+        self.mash = []
+        self.locked = False
+        self.cooldown_until = 0.0
+        self.progress = 0
+        self.saver = None
+        self.last_scan = 0.0
+
+    # --- zařízení ---------------------------------------------------------
+    def rescan(self):
+        self.last_scan = time.monotonic()
+        known = {p for p, _ in self.devs.values()}
+        for path, name in find_keyboards():
+            if path in known:
+                continue
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            except OSError as e:
+                log("nejde otevřít", path, e)
+                continue
+            self.devs[fd] = (path, name)
+            log("hlídám", path, name)
+            if self.locked:
+                self.grab(fd)
+
+    def drop(self, fd):
+        log("odpojeno", self.devs[fd][0])
+        del self.devs[fd]
+        self.down.clear()
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def grab(self, fd):
+        # Než grabneme, pošleme systému uvolnění všech držených kláves, jinak by
+        # v aplikaci zůstala viset autorepetice (grab už release nepustí dál).
+        buf = bytearray((KEY_MAX + 7) // 8)
+        try:
+            fcntl.ioctl(fd, EVIOCGKEY, buf)
+            held = [k for k in range(KEY_MAX + 1) if buf[k // 8] >> (k % 8) & 1]
+            if held:
+                data = b"".join(EVENT.pack(0, 0, EV_KEY, k, 0) for k in held)
+                os.write(fd, data + EVENT.pack(0, 0, EV_SYN, 0, 0))
+            fcntl.ioctl(fd, EVIOCGRAB, 1)
+        except OSError as e:
+            log("grab selhal", self.devs[fd][0], e)
+
+    def ungrab(self, fd):
+        try:
+            fcntl.ioctl(fd, EVIOCGRAB, 0)
+        except OSError:
+            pass
+
+    # --- zámek ------------------------------------------------------------
+    def lock(self, reason):
+        if DEBUG:
+            log("KOČKA (debug, nezamykám):", reason)
+            self.cooldown_until = time.monotonic() + COOLDOWN
+            return
+        log("KOČKA:", reason, "→ zamykám")
+        self.locked = True
+        self.progress = 0
+        self.write_progress()
+        for fd in list(self.devs):
+            self.grab(fd)
+        self.down.clear()
+        self.mash.clear()
+        self.start_saver()
+
+    def unlock(self):
+        log("odemčeno")
+        for fd in list(self.devs):
+            self.ungrab(fd)
+        self.locked = False
+        self.down.clear()
+        self.mash.clear()
+        self.cooldown_until = time.monotonic() + COOLDOWN
+        self.stop_saver()
+        try:
+            os.unlink(PROGRESS_FILE)
+        except OSError:
+            pass
+
+    def write_progress(self):
+        try:
+            with open(PROGRESS_FILE, "w") as f:
+                f.write(f"{self.progress} {UNLOCK}\n")
+        except OSError:
+            pass
+
+    def start_saver(self):
+        # Třída org.omarchy.screensaver: Omarchy okno roztáhne přes celou
+        # obrazovku a svůj vlastní spořič přes něj nespustí.
+        cmd = ["foot", "--app-id=org.omarchy.screensaver"]
+        conf = f"{OMARCHY}/default/foot/screensaver.ini"
+        if os.path.exists(conf):
+            cmd.append(f"--config={conf}")
+        cmd += ["-e", SCREENSAVER]
+        try:
+            self.saver = subprocess.Popen(cmd, start_new_session=True,
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            log("spořič nejde spustit", e)
+
+    def stop_saver(self):
+        if self.saver and self.saver.poll() is None:
+            self.saver.terminate()
+            try:
+                self.saver.wait(2)
+            except subprocess.TimeoutExpired:
+                self.saver.kill()
+        self.saver = None
+
+    # --- události ---------------------------------------------------------
+    def on_key(self, code, value, now):
+        if self.locked:
+            if value != 1 or code in MODIFIERS:
+                return
+            if code == UNLOCK_CODES[self.progress]:
+                self.progress += 1
+            else:
+                self.progress = 1 if code == UNLOCK_CODES[0] else 0
+            self.write_progress()
+            if self.progress == len(UNLOCK_CODES):
+                self.unlock()
+            return
+
+        if code in MODIFIERS:
+            return
+        if value == 0:
+            self.down.pop(code, None)
+            return
+        if value != 1:  # autorepeat
+            return
+        self.down[code] = now
+        if now < self.cooldown_until:
+            return
+        if len(self.down) >= MANY_KEYS:
+            self.lock(f"{len(self.down)} klávesy naráz")
+            return
+        if len(self.down) >= 3:
+            self.mash = [t for t in self.mash if now - t < MASH_WINDOW] + [now]
+            if DEBUG:
+                log(f"3+ naráz ({len(self.mash)}/{MASH_COUNT})")
+            if len(self.mash) >= MASH_COUNT:
+                self.lock("dupání po klávesách")
+
+    def check_hold(self, now):
+        if self.locked or now < self.cooldown_until or len(self.down) < 2:
+            return
+        second_oldest = sorted(self.down.values())[-2]
+        if now - second_oldest >= HOLD_SECONDS:
+            self.lock(f"{len(self.down)} klávesy držené {now - second_oldest:.1f} s")
+
+    def run(self):
+        self.rescan()
+        if "--test" in sys.argv:
+            time.sleep(3)
+            self.lock("test")
+        while True:
+            fds = list(self.devs)
+            r, _, _ = select.select(fds, [], [], 0.25)
+            now = time.monotonic()
+            for fd in r:
+                try:
+                    data = os.read(fd, EVENT.size * 64)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    self.drop(fd)
+                    continue
+                for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                    _, _, typ, code, value = EVENT.unpack_from(data, i)
+                    if typ == EV_KEY:
+                        self.on_key(code, value, now)
+            self.check_hold(now)
+            if self.locked and self.saver and self.saver.poll() is not None:
+                self.start_saver()  # někdo spořič zavřel, klávesnice je pořád zamčená
+            if now - self.last_scan > 5:
+                self.rescan()
+
+
+def main():
+    h = Hlidac()
+
+    def stop(*_):
+        if h.locked:
+            h.unlock()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        h.run()
+    finally:
+        if h.locked:
+            h.unlock()
+
+
+if __name__ == "__main__":
+    main()

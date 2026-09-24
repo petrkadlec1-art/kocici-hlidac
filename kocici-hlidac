@@ -3,18 +3,11 @@
 
 Čte klávesnice přímo z /dev/input (skupina `input`), žádné závislosti.
 
-Detekce (jen ne-modifikátory):
-  - naráz drženo >= MANY_KEYS kláves,
-  - >= 2 klávesy držené současně déle než HOLD_SECONDS (kočka si lehla),
-  - >= MASH_COUNT stisků během MASH_WINDOW s, kdy byly dole >= 3 klávesy (dupání).
+Detekce a nastavení jsou společné s Windows v kocici.py.
 
 Zámek: klávesnice se grabne (EVIOCGRAB), takže do systému nejde nic.
-Odemčení: napsat UNLOCK (výchozí "mnau", v angličtině "meow").
-
-Proměnné prostředí:
-  KOCICI_LANG     cs | en (výchozí podle LANG)
-  KOCICI_UNLOCK   odemykací slovo, jen písmena a–z (fyzická pozice kláves US)
-  KOCICI_POZDRAV  volitelný pozdrav nahoře na spořiči
+Odemčení: napsat odemykací slovo (výchozí "mnau", v angličtině "meow");
+na Linuxu se čte podle fyzické pozice kláves v rozložení US.
 
 Použití:
   kocici-hlidac            démon
@@ -30,13 +23,15 @@ import subprocess
 import sys
 import time
 
-MANY_KEYS = 4
-HOLD_SECONDS = 1.5
-MASH_COUNT = 4
-MASH_WINDOW = 2.0
-COOLDOWN = 5.0
-LANG = os.environ.get("KOCICI_LANG") or ("cs" if os.environ.get("LANG", "").startswith("cs") else "en")
-UNLOCK = os.environ.get("KOCICI_UNLOCK", "mnau" if LANG == "cs" else "meow").lower()
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import kocici  # noqa: E402
+
+try:
+    CFG = kocici.nastaveni()
+except ValueError as e:
+    sys.exit(str(e))
+UNLOCK = CFG["unlock"]
 
 EV_SYN, EV_KEY = 0, 1
 EVENT = struct.Struct("llHHi")
@@ -48,13 +43,11 @@ MODIFIERS = {29, 97, 42, 54, 56, 100, 125, 126, 58}  # ctrl, shift, alt, super, 
 LETTERS = {c: k for c, k in zip("qwertyuiop", range(16, 26))}
 LETTERS.update({c: k for c, k in zip("asdfghjkl", range(30, 39))})
 LETTERS.update({c: k for c, k in zip("zxcvbnm", range(44, 51))})
-if not UNLOCK or any(c not in LETTERS for c in UNLOCK):
-    sys.exit(f"KOCICI_UNLOCK smí obsahovat jen písmena a–z: {UNLOCK!r}")
 UNLOCK_CODES = [LETTERS[c] for c in UNLOCK]
 
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 PROGRESS_FILE = os.path.join(RUNTIME, "kocici-hlidac.progress")
-SCREENSAVER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "kocici-spanek")
+SCREENSAVER = os.path.join(HERE, "kocici-spanek")
 OMARCHY = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")
 
 DEBUG = "--debug" in sys.argv
@@ -93,11 +86,9 @@ def find_keyboards():
 class Hlidac:
     def __init__(self):
         self.devs = {}  # fd -> (path, name)
-        self.down = {}  # keycode -> čas stisku
-        self.mash = []
+        self.det = kocici.Detektor(log if DEBUG else None)
+        self.odem = kocici.Odemykani(UNLOCK_CODES)
         self.locked = False
-        self.cooldown_until = 0.0
-        self.progress = 0
         self.saver = None
         self.last_scan = 0.0
 
@@ -121,7 +112,7 @@ class Hlidac:
     def drop(self, fd):
         log("odpojeno", self.devs[fd][0])
         del self.devs[fd]
-        self.down.clear()
+        self.det.reset()
         try:
             os.close(fd)
         except OSError:
@@ -151,16 +142,15 @@ class Hlidac:
     def lock(self, reason):
         if DEBUG:
             log("KOČKA (debug, nezamykám):", reason)
-            self.cooldown_until = time.monotonic() + COOLDOWN
+            self.det.reset(time.monotonic())
             return
         log("KOČKA:", reason, "→ zamykám")
         self.locked = True
-        self.progress = 0
+        self.odem.progress = 0
         self.write_progress()
         for fd in list(self.devs):
             self.grab(fd)
-        self.down.clear()
-        self.mash.clear()
+        self.det.reset()
         self.start_saver()
 
     def unlock(self):
@@ -168,9 +158,7 @@ class Hlidac:
         for fd in list(self.devs):
             self.ungrab(fd)
         self.locked = False
-        self.down.clear()
-        self.mash.clear()
-        self.cooldown_until = time.monotonic() + COOLDOWN
+        self.det.reset(time.monotonic())
         self.stop_saver()
         try:
             os.unlink(PROGRESS_FILE)
@@ -180,7 +168,7 @@ class Hlidac:
     def write_progress(self):
         try:
             with open(PROGRESS_FILE, "w") as f:
-                f.write(f"{self.progress} {UNLOCK}\n")
+                f.write(f"{self.odem.progress} {UNLOCK}\n")
         except OSError:
             pass
 
@@ -209,44 +197,27 @@ class Hlidac:
 
     # --- události ---------------------------------------------------------
     def on_key(self, code, value, now):
-        if self.locked:
-            if value != 1 or code in MODIFIERS:
-                return
-            if code == UNLOCK_CODES[self.progress]:
-                self.progress += 1
-            else:
-                self.progress = 1 if code == UNLOCK_CODES[0] else 0
-            self.write_progress()
-            if self.progress == len(UNLOCK_CODES):
-                self.unlock()
-            return
-
         if code in MODIFIERS:
             return
+        if self.locked:
+            if value == 1:
+                if self.odem.feed(code):
+                    self.unlock()
+                else:
+                    self.write_progress()
+            return
         if value == 0:
-            self.down.pop(code, None)
-            return
-        if value != 1:  # autorepeat
-            return
-        self.down[code] = now
-        if now < self.cooldown_until:
-            return
-        if len(self.down) >= MANY_KEYS:
-            self.lock(f"{len(self.down)} klávesy naráz")
-            return
-        if len(self.down) >= 3:
-            self.mash = [t for t in self.mash if now - t < MASH_WINDOW] + [now]
-            if DEBUG:
-                log(f"3+ naráz ({len(self.mash)}/{MASH_COUNT})")
-            if len(self.mash) >= MASH_COUNT:
-                self.lock("dupání po klávesách")
+            self.det.release(code)
+        elif value == 1:  # 2 = autorepetice
+            reason = self.det.press(code, now)
+            if reason:
+                self.lock(reason)
 
     def check_hold(self, now):
-        if self.locked or now < self.cooldown_until or len(self.down) < 2:
-            return
-        second_oldest = sorted(self.down.values())[-2]
-        if now - second_oldest >= HOLD_SECONDS:
-            self.lock(f"{len(self.down)} klávesy držené {now - second_oldest:.1f} s")
+        if not self.locked:
+            reason = self.det.tick(now)
+            if reason:
+                self.lock(reason)
 
     def run(self):
         self.rescan()

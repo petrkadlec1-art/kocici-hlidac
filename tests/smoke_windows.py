@@ -84,8 +84,12 @@ def wait_count(path, needle, n, timeout):
 
 def cat_pixels(img):
     """Kolik pixelů má barvu kočky (#ffaf5f) — spořič je vidět."""
-    small = img.convert("RGB").resize((img.width // 2, img.height // 2))
-    return sum(1 for r, g, b in small.getdata() if r > 220 and 150 < g < 200 and 60 < b < 130)
+    # Tenké vyhlazené písmo: celý snímek, tolerantní odstín. Kalibrováno na snímcích
+    # z windows-latest (1024×768): zamčeno ~1000 px, odemčená plocha ~100 px.
+    px = img.convert("RGB").tobytes()
+    return sum(1 for i in range(0, len(px), 3)
+               if px[i] > 200 and 130 < px[i + 1] < 200 and 50 < px[i + 2] < 140
+               and px[i] - px[i + 2] > 90)
 
 
 def main():
@@ -127,7 +131,7 @@ def main():
         img = ImageGrab.grab()
         img.save(os.path.join(shots, "zamceno.png"))
         n = cat_pixels(img)
-        check(n > 200, f"kočka je na obrazovce ({n} px)")
+        check(n >= 400, f"kočka je na obrazovce ({n} px)")
 
         type_text("meox")
         time.sleep(0.5)
@@ -138,7 +142,8 @@ def main():
         time.sleep(1)
         img = ImageGrab.grab()
         img.save(os.path.join(shots, "odemceno.png"))
-        check(cat_pixels(img) < 50, "po odemčení kočka zmizela")
+        n = cat_pixels(img)
+        check(n < 250, f"po odemčení kočka zmizela ({n} px)")
 
         # Kočka si lehne: dvě klávesy držené (s autorepeticí jako na Windows).
         time.sleep(5.5)  # cooldown po odemčení

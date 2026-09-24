@@ -80,7 +80,10 @@ def log(*a):
         except OSError:
             pass
     if sys.stdout:
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except (OSError, UnicodeError):
+            pass  # konzole bez UTF-8 nesmí shodit hook
 
 
 # --- Win32 -----------------------------------------------------------------

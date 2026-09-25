@@ -47,10 +47,14 @@ until a human types the unlock word (`meow` by default).
 
 ## Windows
 
-Download `kocici-hlidac.exe` from
+Download `kocici-hlidac-setup.exe` from
 [Releases](https://github.com/petrkadlec1-art/kocici-hlidac/releases) and run it.
-A sleeping-cat icon appears in the tray. On first start it turns on
-*Start at login* and shows the unlock word in a notification.
+It installs for your user only (no admin rights), adds a Start menu entry and
+lets you choose *Start at login*; uninstall it from *Settings → Apps*.
+A sleeping-cat icon appears in the tray and a notification shows the unlock word.
+
+Prefer no installer? Download the plain `kocici-hlidac.exe` and run it; on first
+start it turns on *Start at login* by itself.
 
 Right-click the tray icon to **test the lock**, toggle **start at login**,
 **open settings** or **quit**.
@@ -154,8 +158,11 @@ Kočka si lehne na klávesnici. `kocici-hlidac` to pozná, klávesnici zamkne,
 takže do aplikací nic neprojde, a ukáže spící kočku, dokud člověk nenapíše
 odemykací slovo (česky `mnau`).
 
-**Windows:** stáhni `kocici-hlidac.exe` z
+**Windows:** stáhni `kocici-hlidac-setup.exe` z
 [Releases](https://github.com/petrkadlec1-art/kocici-hlidac/releases) a spusť.
+Instaluje se jen pro tebe (bez admin práv), přidá zástupce do Startu a zeptá se
+na spouštění po přihlášení; odinstaluješ ho v *Nastavení → Aplikace*. Bez
+instalátoru stačí samotný `kocici-hlidac.exe`.
 V oznamovací oblasti se objeví spící kočka; pravým tlačítkem zámek vyzkoušíš,
 vypneš spouštění po přihlášení, otevřeš nastavení nebo hlídače ukončíš.
 Windows může poprvé varovat, že aplikace není podepsaná (*Další informace →

@@ -227,6 +227,11 @@ def autostart_command():
     return f'"{pythonw if os.path.exists(pythonw) else exe}" "{os.path.abspath(__file__)}"'
 
 
+def installed():
+    """Běží z instalátoru? Pak o autostartu rozhodl instalátor."""
+    return os.path.exists(os.path.join(os.path.dirname(sys.executable), "unins000.exe"))
+
+
 def autostart_enabled():
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
@@ -435,7 +440,7 @@ class Hlidac:
             try:
                 os.makedirs(APP_DIR, exist_ok=True)
                 open(os.path.join(APP_DIR, ".spusteno"), "w").close()
-                if getattr(sys, "frozen", False) and not ACCEPT_INJECTED:
+                if getattr(sys, "frozen", False) and not ACCEPT_INJECTED and not installed():
                     set_autostart(True)
             except OSError as e:
                 log("první spuštění:", e)

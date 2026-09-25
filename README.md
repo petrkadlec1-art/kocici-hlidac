@@ -2,6 +2,8 @@
 
 *[Česky níže](#česky)*
 
+![A tabby cat asleep on a laptop keyboard; the screen shows the ASCII sleeping cat and the lock message](docs/kocka-na-klavesnici.jpg)
+
 A cat lies down on your keyboard. `kocici-hlidac` ("cat guard") notices,
 blocks the keyboard so nothing reaches your apps, and shows a sleeping cat
 until a human types the unlock word (`meow` by default).
@@ -67,6 +69,23 @@ Notes:
 - The screensaver covers the main monitor.
 
 ## Linux
+
+Download `kocici-hlidac-linux.tar.gz` from
+[Releases](https://github.com/petrkadlec1-art/kocici-hlidac/releases) and run:
+
+```bash
+tar -xzf kocici-hlidac-linux.tar.gz
+cd kocici-hlidac && ./install.sh
+```
+
+It installs for your user only. The one time it asks for your password is to
+add you to the `input` group; then log out and back in and the guard starts by
+itself at every login. `./install.sh --uninstall` removes it again. Needs
+Python 3, systemd and a desktop that starts `graphical-session.target`
+(GNOME, KDE, Omarchy do; the installer warns you if yours does not); the cat
+itself shows up in the [foot](https://codeberg.org/dnkl/foot) terminal.
+
+By hand, from a clone:
 
 ```bash
 # 1. Access to /dev/input (log out and back in afterwards)
@@ -168,7 +187,18 @@ vypneš spouštění po přihlášení, otevřeš nastavení nebo hlídače ukon
 Windows může poprvé varovat, že aplikace není podepsaná (*Další informace →
 Přesto spustit*).
 
-**Linux:** příkazy v sekci *Linux* výše.
+**Linux:** stáhni `kocici-hlidac-linux.tar.gz` z
+[Releases](https://github.com/petrkadlec1-art/kocici-hlidac/releases) a spusť:
+
+```bash
+tar -xzf kocici-hlidac-linux.tar.gz
+cd kocici-hlidac && ./install.sh
+```
+
+Instaluje se jen pro tebe. Heslo chce jednou, kvůli skupině `input`; pak se
+odhlas a přihlas a hlídač od té doby naběhne sám. Odinstaluješ ho přes
+`./install.sh --uninstall`. Potřebuje Python 3 a systemd, kočku kreslí
+terminál foot. Ruční postup je v sekci *Linux* výše.
 
 **Nastavení** v `nastaveni.ini` (viz *Settings*): `lang = cs`,
 `unlock = mnau`, `greeting = Ahoj kotě! :)`. Prázdný `greeting` pozdrav schová.

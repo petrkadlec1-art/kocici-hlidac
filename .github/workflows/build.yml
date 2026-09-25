@@ -64,10 +64,32 @@ jobs:
           path: |
             dist/kocici-hlidac.exe
             dist/kocici-hlidac-setup.exe
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+
+  linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tools/balicek_linux.sh dist/kocici-hlidac-linux.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kocici-hlidac-linux
+          path: dist/kocici-hlidac-linux.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kocici-hlidac-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/kocici-hlidac-setup.exe
             dist/kocici-hlidac.exe
+            dist/kocici-hlidac-linux.tar.gz
+          fail_on_unmatched_files: true

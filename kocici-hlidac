@@ -8,6 +8,12 @@ Detekce a nastavení jsou společné s Windows v kocici.py.
 Zámek: klávesnice se grabne (EVIOCGRAB), takže do systému nejde nic.
 Odemčení: napsat odemykací slovo (výchozí "mnau", v angličtině "meow");
 na Linuxu se čte podle fyzické pozice kláves v rozložení US.
+Pojistky: zámek se sám uvolní, když je klávesnice QUIET_UNLOCK s úplně
+v klidu (kočka odešla), a po uspání (heslo pak chce zamykací obrazovka,
+kterou by grab zablokoval). Displej po SCREEN_OFF_AFTER s zhasne,
+rozsvítí ho touchpad nebo myš.
+
+Teploty, větráky, baterii a jas zapisuje do ~/.local/state/kocici-hlidac/telemetrie.csv.
 
 Použití:
   kocici-hlidac            démon
@@ -26,6 +32,7 @@ import time
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 import kocici  # noqa: E402
+import telemetrie  # noqa: E402
 
 try:
     CFG = kocici.nastaveni()
@@ -51,6 +58,16 @@ SCREENSAVER = os.path.join(HERE, "kocici-spanek")
 OMARCHY = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")
 
 DEBUG = "--debug" in sys.argv
+
+QUIET_UNLOCK = 150        # s bez jediné události z klávesnice -> odemknout
+SCREEN_OFF_AFTER = 60     # s zámku bez pohybu myši -> zhasnout displej
+SUSPEND_GAP = 5           # s, o které boottime předběhne monotonic = byl spánek
+TELEMETRY_LOCKED = 30     # s mezi řádky CSV při zámku
+TELEMETRY_IDLE = 300      # s mezi řádky CSV bez zámku
+JOURNAL_LOCKED = 300      # s mezi souhrny do journalu při zámku
+KEYLOG_MAX = 200          # víc stisků za jeden zámek do journalu nepíšeme
+
+KEY_NAMES = {k: c for c, k in LETTERS.items()}
 
 
 def log(*a):
@@ -83,14 +100,73 @@ def find_keyboards():
     return found
 
 
+def find_pointers():
+    """Myš, touchpad, dotyková obrazovka: jen probouzejí displej, negrabují se."""
+    found = []
+    with open("/proc/bus/input/devices") as f:
+        text = f.read()
+    for chunk in text.strip().split("\n\n"):
+        name, handlers = "", []
+        for line in chunk.splitlines():
+            if line.startswith("N: Name="):
+                name = line[8:].strip('"')
+            elif line.startswith("H: Handlers="):
+                handlers = line[12:].split()
+        if "kbd" in handlers or not any(h.startswith("mouse") for h in handlers):
+            continue
+        ev = next((h for h in handlers if h.startswith("event")), None)
+        if ev:
+            found.append(("/dev/input/" + ev, name))
+    return found
+
+
+def dpms(state):
+    """Zapne/vypne displej přes Hyprland; jinde tiše nic neudělá."""
+    for arg in (f'hl.dsp.dpms({{action="{state}"}})', None):
+        cmd = ["hyprctl", "dispatch"] + ([arg] if arg else ["dpms", state])
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if out.strip() == "ok":
+            return True
+    return False
+
+
+def screen_locked():
+    """Běží zamykací obrazovka Omarchy? Mimo Omarchy vždy False."""
+    try:
+        out = subprocess.run(["omarchy-shell", "lock", "isLocked"],
+                             capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.strip() == "true"
+
+
+def held_keys(fd):
+    buf = bytearray((KEY_MAX + 7) // 8)
+    fcntl.ioctl(fd, EVIOCGKEY, buf)
+    return [k for k in range(KEY_MAX + 1) if buf[k // 8] >> (k % 8) & 1]
+
+
 class Hlidac:
     def __init__(self):
         self.devs = {}  # fd -> (path, name)
+        self.pointers = {}  # fd -> (path, name)
         self.det = kocici.Detektor(log if DEBUG else None)
         self.odem = kocici.Odemykani(UNLOCK_CODES)
         self.locked = False
         self.saver = None
         self.last_scan = 0.0
+        self.locked_at = 0.0
+        self.last_key = 0.0      # poslední událost z klávesnice (i autorepetice)
+        self.last_pointer = 0.0
+        self.screen_off = False
+        self.keylog = 0
+        self.tele = telemetrie.Telemetrie()
+        self.next_tele = 0.0
+        self.next_journal = 0.0
+        self.clock_gap = self.suspend_gap()
 
     # --- zařízení ---------------------------------------------------------
     def rescan(self):
@@ -108,8 +184,25 @@ class Hlidac:
             log("hlídám", path, name)
             if self.locked:
                 self.grab(fd)
+        known = {p for p, _ in self.pointers.values()}
+        for path, name in find_pointers():
+            if path in known:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as e:
+                log("nejde otevřít", path, e)
+                continue
+            self.pointers[fd] = (path, name)
 
     def drop(self, fd):
+        if fd in self.pointers:
+            del self.pointers[fd]
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return
         log("odpojeno", self.devs[fd][0])
         del self.devs[fd]
         self.det.reset()
@@ -121,10 +214,8 @@ class Hlidac:
     def grab(self, fd):
         # Než grabneme, pošleme systému uvolnění všech držených kláves, jinak by
         # v aplikaci zůstala viset autorepetice (grab už release nepustí dál).
-        buf = bytearray((KEY_MAX + 7) // 8)
         try:
-            fcntl.ioctl(fd, EVIOCGKEY, buf)
-            held = [k for k in range(KEY_MAX + 1) if buf[k // 8] >> (k % 8) & 1]
+            held = held_keys(fd)
             if held:
                 data = b"".join(EVENT.pack(0, 0, EV_KEY, k, 0) for k in held)
                 os.write(fd, data + EVENT.pack(0, 0, EV_SYN, 0, 0))
@@ -144,26 +235,40 @@ class Hlidac:
             log("KOČKA (debug, nezamykám):", reason)
             self.det.reset(time.monotonic())
             return
+        if screen_locked():
+            # Zamykací obrazovka chce heslo; grab by ho nepustil a kočka tam nic nezmůže.
+            log("KOČKA:", reason, "→ nezamykám, je zamčená obrazovka")
+            self.det.reset(time.monotonic())
+            return
         log("KOČKA:", reason, "→ zamykám")
+        now = time.monotonic()
         self.locked = True
+        self.locked_at = self.last_key = now
+        self.last_pointer = 0.0
+        self.keylog = 0
         self.odem.progress = 0
         self.write_progress()
         for fd in list(self.devs):
             self.grab(fd)
         self.det.reset()
         self.start_saver()
+        self.telemetry(now, force=True)
 
-    def unlock(self):
-        log("odemčeno")
+    def unlock(self, how="slovem"):
+        log(f"odemčeno ({how}) po {time.monotonic() - self.locked_at:.0f} s")
         for fd in list(self.devs):
             self.ungrab(fd)
         self.locked = False
         self.det.reset(time.monotonic())
         self.stop_saver()
+        if self.screen_off:
+            dpms("on")
+            self.screen_off = False
         try:
             os.unlink(PROGRESS_FILE)
         except OSError:
             pass
+        self.telemetry(time.monotonic(), force=True)
 
     def write_progress(self):
         try:
@@ -197,14 +302,21 @@ class Hlidac:
 
     # --- události ---------------------------------------------------------
     def on_key(self, code, value, now):
+        self.last_key = now
         if code in MODIFIERS:
+            if self.locked and value == 1:
+                self.log_locked_key(code)
             return
         if self.locked:
             if value == 1:
-                if self.odem.feed(code):
+                done = self.odem.feed(code)
+                self.log_locked_key(code, done)
+                if done:
                     self.unlock()
                 else:
                     self.write_progress()
+                    if self.odem.progress and self.screen_off:
+                        self.wake_screen(now)  # někdo píše slovo, ať vidí postup
             return
         if value == 0:
             self.det.release(code)
@@ -213,11 +325,78 @@ class Hlidac:
             if reason:
                 self.lock(reason)
 
+    def log_locked_key(self, code, done=False):
+        """Stisky při zámku do journalu, ať jde zpětně poznat, proč slovo neprošlo."""
+        self.keylog += 1
+        if self.keylog > KEYLOG_MAX:
+            return
+        name = KEY_NAMES.get(code, "")
+        tail = " (dál už nepíšu)" if self.keylog == KEYLOG_MAX else ""
+        log(f"zámek: klávesa {code}{' ' + name if name else ''}, "
+            f"slovo {len(UNLOCK) if done else self.odem.progress}/{len(UNLOCK)}{tail}")
+
     def check_hold(self, now):
         if not self.locked:
             reason = self.det.tick(now)
             if reason:
                 self.lock(reason)
+
+    # --- pojistky a displej -------------------------------------------------
+    @staticmethod
+    def suspend_gap():
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+
+    def check_suspend(self):
+        gap = self.suspend_gap()
+        slept = gap - self.clock_gap
+        self.clock_gap = gap
+        if slept > SUSPEND_GAP and self.locked:
+            log(f"počítač spal {slept:.0f} s")
+            self.unlock("po uspání, dál hlídá zamykací obrazovka")
+
+    def check_quiet(self, now):
+        if not self.locked or now - self.last_key < QUIET_UNLOCK:
+            return
+        held = []
+        for fd in list(self.devs):
+            try:
+                held += held_keys(fd)
+            except OSError:
+                pass
+        if held:
+            self.last_key = now  # kočka pořád leží, jen se nehýbe
+            log(f"zámek: {QUIET_UNLOCK} s ticho, ale drží se {len(held)} kláves → nechávám")
+            return
+        self.unlock(f"sám, klávesnice {QUIET_UNLOCK} s v klidu")
+
+    def wake_screen(self, now):
+        self.last_pointer = now
+        if self.screen_off:
+            dpms("on")
+            self.screen_off = False
+
+    def check_screen(self, now):
+        if not self.locked or self.screen_off:
+            return
+        if now - max(self.locked_at, self.last_pointer) >= SCREEN_OFF_AFTER:
+            if dpms("off"):
+                self.screen_off = True
+                log("zámek: zhasínám displej (rozsvítí touchpad)")
+
+    def on_pointer(self, now):
+        self.last_pointer = now
+        self.screen_off = False  # Hyprland displej rozsvítí sám (mouse_move_enables_dpms)
+
+    def telemetry(self, now, force=False):
+        if not force and now < self.next_tele:
+            return
+        saver = self.saver.pid if self.saver and self.saver.poll() is None else None
+        row = self.tele.sample(self.locked, self.screen_off, saver)
+        self.tele.write(row)
+        self.next_tele = now + (TELEMETRY_LOCKED if self.locked else TELEMETRY_IDLE)
+        if force or (self.locked and now >= self.next_journal):
+            log("stav:", self.tele.summary(row))
+            self.next_journal = now + JOURNAL_LOCKED
 
     def run(self):
         self.rescan()
@@ -225,10 +404,20 @@ class Hlidac:
             time.sleep(3)
             self.lock("test")
         while True:
-            fds = list(self.devs)
+            fds = list(self.devs) + list(self.pointers)
             r, _, _ = select.select(fds, [], [], 0.25)
             now = time.monotonic()
             for fd in r:
+                if fd in self.pointers:
+                    try:
+                        os.read(fd, EVENT.size * 64)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        self.drop(fd)
+                        continue
+                    self.on_pointer(now)
+                    continue
                 try:
                     data = os.read(fd, EVENT.size * 64)
                 except BlockingIOError:
@@ -241,6 +430,10 @@ class Hlidac:
                     if typ == EV_KEY:
                         self.on_key(code, value, now)
             self.check_hold(now)
+            self.check_suspend()
+            self.check_quiet(now)
+            self.check_screen(now)
+            self.telemetry(now)
             if self.locked and self.saver and self.saver.poll() is not None:
                 self.start_saver()  # někdo spořič zavřel, klávesnice je pořád zamčená
             if now - self.last_scan > 5:

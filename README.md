@@ -27,6 +27,14 @@ until a human types the unlock word (`meow` by default).
 - Blocks the keyboard. Keys the cat already pressed are released first, so no
   autorepeat gets stuck in your editor. The mouse keeps working.
 - Unlocks when you type the unlock word.
+- Linux safety nets: unlocks by itself after 150 s with no keyboard activity
+  (the cat left), and after the machine wakes from sleep (so the lock
+  screen can take your password). It never locks while the Omarchy lock
+  screen is up. After 60 s the display turns off; the touchpad wakes it.
+- Linux telemetry: temperatures, fans, battery, brightness and power profile
+  go to `~/.local/state/kocici-hlidac/telemetrie.csv` (every 30 s while locked,
+  every 5 min otherwise); a summary and every key pressed while locked go to
+  the journal (`journalctl --user -u kocici-hlidac`).
 - Python 3 standard library only. The detection is shared (`kocici.py`),
   each platform has its own input layer and screensaver.
 
@@ -64,7 +72,7 @@ sudo usermod -aG input "$USER"
 git clone https://github.com/petrkadlec1-art/kocici-hlidac.git
 cd kocici-hlidac
 install -Dm755 kocici-hlidac kocici-spanek -t ~/.local/bin/
-install -Dm644 kocici.py -t ~/.local/bin/
+install -Dm644 kocici.py telemetrie.py -t ~/.local/bin/
 install -Dm644 kocici-hlidac.service -t ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now kocici-hlidac
@@ -157,6 +165,13 @@ Přesto spustit*).
 
 **Nastavení** v `nastaveni.ini` (viz *Settings*): `lang = cs`,
 `unlock = mnau`, `greeting = Ahoj kotě! :)`. Prázdný `greeting` pozdrav schová.
+
+**Pojistky na Linuxu:** zámek se sám uvolní po 150 s bez jediné události
+z klávesnice (kočka odešla) a po probuzení ze spánku (heslo pak chce zamykací
+obrazovka). Když je zamykací obrazovka Omarchy nahoře, nezamyká. Po 60 s zhasne
+displej, rozsvítí ho touchpad. Teploty, větráky, baterie a jas se zapisují do
+`~/.local/state/kocici-hlidac/telemetrie.csv`, souhrn a stisky při zámku do
+journalu (`journalctl --user -u kocici-hlidac`).
 
 **Detekce** (modifikátory se nepočítají): 4+ klávesy naráz; 2+ klávesy držené
 1,5 s; 4 stisky za 2 s, když byly dole 3+ klávesy.

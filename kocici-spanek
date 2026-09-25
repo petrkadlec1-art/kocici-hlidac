@@ -73,7 +73,8 @@ def main():
             n, word = read_progress(cfg["unlock"])
             sys.stdout.write(render(*scena.frame(t, cols, rows, n, word)))
             sys.stdout.flush()
-            r, _, _ = select.select([fd], [], [], 0.15)
+            # The scene changes slowly; redraw at 1 FPS to keep the saver cool.
+            r, _, _ = select.select([fd], [], [], 1.0)
             if r:
                 break  # klávesa prošla = hlídač neběží, nenechávej okno viset
     finally:

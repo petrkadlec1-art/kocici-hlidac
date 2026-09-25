@@ -41,6 +41,14 @@ def wait(cond, secs=30):
     return cond()
 
 
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def check(ok, msg):
     print(("OK   " if ok else "FAIL ") + msg, flush=True)
     if not ok:
@@ -58,6 +66,7 @@ def main():
     target = os.path.join(tempfile.mkdtemp(), "kocici-hlidac")
     exe = os.path.join(target, "kocici-hlidac.exe")
     marker = os.path.join(os.environ["APPDATA"], "kocici-hlidac", ".spusteno")
+    log = os.path.join(os.environ["LOCALAPPDATA"], "kocici-hlidac", "hlidac.log")
     if os.path.exists(marker):
         os.remove(marker)
 
@@ -68,7 +77,10 @@ def main():
 
     subprocess.Popen([exe])
     check(wait(running), "nainstalovaný hlídač běží")
-    check(wait(lambda: os.path.exists(marker)), "hlídač dokončil první spuštění")
+    # "hlídám klávesnici" se loguje až po případném zápisu autostartu.
+    check(wait(lambda: os.path.exists(marker) and "hlídám klávesnici" in read(log)),
+          "hlídač dokončil první spuštění")
+    print(read(log), flush=True)
     check(run_value() is None, "první spuštění si autostart samo nezapnulo")
 
     install(setup, target, "autostart")

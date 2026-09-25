@@ -1,0 +1,95 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHONUTF8: "1"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller pillow
+      - run: python tools/make_icon.py kocka.ico
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --windowed --name kocici-hlidac
+          --icon kocka.ico --add-data "kocka.ico;."
+          kocici_windows.pyw
+      - name: Smoke test on the Windows desktop
+        run: python tests/smoke_windows.py dist/kocici-hlidac.exe screenshots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: screenshots/
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "0.0.0-dev" }
+          & $iscc "/DAppVersion=$ver" installer\kocici-hlidac.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Test the installer
+        run: python tests/installer_windows.py dist/kocici-hlidac-setup.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kocici-hlidac-windows
+          path: |
+            dist/kocici-hlidac.exe
+            dist/kocici-hlidac-setup.exe
+
+  linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tools/balicek_linux.sh dist/kocici-hlidac-linux.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kocici-hlidac-linux
+          path: dist/kocici-hlidac-linux.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kocici-hlidac-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/kocici-hlidac-setup.exe
+            dist/kocici-hlidac.exe
+            dist/kocici-hlidac-linux.tar.gz
+          fail_on_unmatched_files: true
